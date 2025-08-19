@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Net.Http;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using LibVLCSharp.Shared;
@@ -13,7 +14,7 @@ namespace WinFormsApp_IPTVPoC
     {
         // UI controls
         private Panel leftPanel;
-        private ListBox lstChannels;
+        private TreeView tvChannels;
         private Button btnToggleList;
         private Button btnUp;
         private Button btnDown;
@@ -82,6 +83,14 @@ namespace WinFormsApp_IPTVPoC
             };
             Controls.Add(topPanel);
 
+            var btnFullscreenTop = new Button
+            {
+                Text = "Fullscreen",
+                Width = 90
+            };
+            btnFullscreenTop.Click += BtnFullscreen_Click;
+            topPanel.Controls.Add(btnFullscreenTop);
+
             // Always-visible toggle list button
             var btnToggleListTop = new Button
             {
@@ -111,16 +120,18 @@ namespace WinFormsApp_IPTVPoC
             Controls.Add(leftPanel);
 
             // Channel list
-            lstChannels = new ListBox
+            tvChannels = new TreeView
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black,
                 ForeColor = Color.White,
                 Font = new Font("Segoe UI", 9),
-                BorderStyle = BorderStyle.None
+                BorderStyle = BorderStyle.None,
+                HideSelection = false
             };
-            lstChannels.SelectedIndexChanged += LstChannels_SelectedIndexChanged;
-            leftPanel.Controls.Add(lstChannels);
+            tvChannels.AfterSelect += TvChannels_AfterSelect;
+            leftPanel.Controls.Add(tvChannels);
+
 
             // Buttons under list
             var buttonsPanel = new FlowLayoutPanel
@@ -196,6 +207,16 @@ namespace WinFormsApp_IPTVPoC
             Controls.Add(lblNowPlaying);
         }
 
+        private void TvChannels_AfterSelect(object sender, TreeViewEventArgs e)
+        {
+            if (e.Node?.Tag is string url)
+            {
+                PlayUrl(url);
+                lblNowPlaying.Text = "Now Playing: " + e.Node.Text;
+            }
+        }
+
+
         private Button MakeButton(string text, EventHandler onClick)
         {
             var btn = new Button
@@ -219,41 +240,58 @@ namespace WinFormsApp_IPTVPoC
                 using var http = new HttpClient();
                 var data = await http.GetStringAsync(playlistUrl);
 
-                var lines = data.Split('\n');
-                var channels = new List<string>();
-                foreach (var line in lines)
+                // Clear old nodes
+                tvChannels.BeginInvoke(new Action(() => tvChannels.Nodes.Clear()));
+
+                var lines = data.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+
+                for (int i = 0; i < lines.Length; i++)
                 {
-                    var trimmed = line.Trim();
-                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
+                    var line = lines[i].Trim();
+                    if (line.StartsWith("#EXTINF:", StringComparison.OrdinalIgnoreCase))
                     {
-                        channels.Add(trimmed);
+                        string currentGroup = "Other";
+
+                        // Extract group-title
+                        var groupMatch = Regex.Match(line, @"group-title\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        if (groupMatch.Success)
+                            currentGroup = groupMatch.Groups[1].Value.Trim();
+
+                        // Extract channel label (after last comma)
+                        string label = line.Contains(",") ? line.Substring(line.LastIndexOf(',') + 1).Trim() : "Unknown";
+
+                        // Next line should be the URL
+                        if (i + 1 < lines.Length)
+                        {
+                            string url = lines[i + 1].Trim();
+                            if (url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                            {
+                                tvChannels.BeginInvoke(new Action(() =>
+                                {
+                                    // Ensure group node exists
+                                    TreeNode groupNode = tvChannels.Nodes.Cast<TreeNode>()
+                                        .FirstOrDefault(n => n.Text == currentGroup);
+
+                                    if (groupNode == null)
+                                    {
+                                        groupNode = new TreeNode(currentGroup);
+                                        tvChannels.Nodes.Add(groupNode);
+                                    }
+
+                                    // Add channel under group
+                                    var channelNode = new TreeNode(label) { Tag = url };
+                                    groupNode.Nodes.Add(channelNode);
+                                }));
+                            }
+                        }
                     }
                 }
 
-                lstChannels.BeginInvoke(new Action(() =>
-                {
-                    lstChannels.Items.Clear();
-                    foreach (var channel in channels)
-                    {
-                        lstChannels.Items.Add(channel);
-                    }
-                }));
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Failed to load playlist: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        }
-
-        private void LstChannels_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            var selected = lstChannels.SelectedItem as string;
-            if (string.IsNullOrEmpty(selected)) return;
-
-            PlayUrl(selected);
-            lblNowPlaying.Text = "Now Playing: " + selected;
-            picPoster.Visible = false;
-            txtOverview.Visible = false;
         }
 
         private void PlayUrl(string url)
@@ -272,14 +310,56 @@ namespace WinFormsApp_IPTVPoC
 
         private void BtnUp_Click(object sender, EventArgs e)
         {
-            if (lstChannels.SelectedIndex > 0)
-                lstChannels.SelectedIndex--;
+            if (tvChannels.SelectedNode == null) return;
+
+            TreeNode current = tvChannels.SelectedNode;
+
+            // If it's a child node, move to the previous sibling or wrap up
+            if (current.Parent != null)
+            {
+                int index = current.Index;
+                if (index > 0)
+                {
+                    tvChannels.SelectedNode = current.Parent.Nodes[index - 1];
+                    tvChannels.SelectedNode.EnsureVisible();
+                }
+                else if (current.Parent.PrevNode != null) // go to previous group’s last channel
+                {
+                    TreeNode prevGroup = current.Parent.PrevNode;
+                    if (prevGroup.Nodes.Count > 0)
+                    {
+                        tvChannels.SelectedNode = prevGroup.Nodes[prevGroup.Nodes.Count - 1];
+                        tvChannels.SelectedNode.EnsureVisible();
+                    }
+                }
+            }
         }
 
         private void BtnDown_Click(object sender, EventArgs e)
         {
-            if (lstChannels.SelectedIndex < lstChannels.Items.Count - 1)
-                lstChannels.SelectedIndex++;
+            if (tvChannels.SelectedNode == null) return;
+
+            TreeNode current = tvChannels.SelectedNode;
+
+            // If it's a child node, move to the next sibling or wrap down
+            if (current.Parent != null)
+            {
+                int index = current.Index;
+                if (index < current.Parent.Nodes.Count - 1)
+                {
+                    tvChannels.SelectedNode = current.Parent.Nodes[index + 1];
+                    tvChannels.SelectedNode.EnsureVisible();
+                }
+                else if (current.Parent.NextNode != null) // go to next group’s first channel
+                {
+                    TreeNode nextGroup = current.Parent.NextNode;
+                    if (nextGroup.Nodes.Count > 0)
+                    {
+                        tvChannels.SelectedNode = nextGroup.Nodes[0];
+                        tvChannels.SelectedNode.EnsureVisible();
+                    }
+                }
+            }
         }
 
         private void BtnSettings_Click(object sender, EventArgs e)
